@@ -16,7 +16,7 @@
 │   ├── main.py            # FastAPI 应用入口 / HTTP API
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # SQLite 连接、建表、初始化
-│   ├── crud.py            # 持久化层（规则集 / 版本 / 决策结果）
+│   ├── crud.py            # 持久化层（规则集 / 版本 / 决策结果 / 客户端幂等）
 │   ├── engine/
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
@@ -188,7 +188,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
 | `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
-| `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
+| `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果；支持 `Idempotency-Key` 客户端幂等 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
 | `POST` | `/api/rulesets/{id}/coverage` | 多文档覆盖分析（1～100 份，不落库）：命中/未命中规则、已观察冲突场景与贪心代表输入 |
 | `POST` | `/api/rulesets/{id}/compare` | 发布前预演：同一文档按两个版本求值（不落库），返回两版决策与差异摘要 |
@@ -302,6 +302,79 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > 注意：批量接口在存在失败项时仍返回 **HTTP 200**，通过每项的
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
+
+### 单文档决策的客户端幂等
+
+对 `POST /api/rulesets/{id}/evaluate` 的**持久化调用**（默认
+`persist=true`），可通过 `Idempotency-Key` 请求头携带客户端幂等键，
+保证“同一请求重试一次与多次效果相同”。幂等键的作用域为**单个规则集**，
+不同规则集可以使用相同的键。
+
+行为约定：
+
+- **首次受理固定实际规则版本**：服务把规则集、幂等键、请求的版本选择
+  方式（缺省“最新版”或 `?version=n` 指定版本号）、按对象键递归排序
+  规范化后的文档与**完整决策结果**（`evaluations` 记录 ID）原子关联
+  保存；
+- **相同请求重试直接返回首次结果**：同一规则集、同一键，且文档规范化后
+  相同（JSON 对象键顺序不同视为相同；**数组顺序参与语义**）、版本选择
+  方式相同的请求，即使是并发重试、或重试期间规则集已发布新版本，都返回
+  **首次的决策结果与原记录 ID**，不重复求值、不重复落库（latest 模式也
+  固定返回首次受理时的最新版结果）；
+- **键冲突**：同一键但文档或版本选择方式（latest / 显式版本号）不同，
+  返回 **HTTP 409** `IDEMPOTENCY_KEY_CONFLICT`，响应体 `details` 指出
+  冲突项（`document` / `version_selection`），不产生任何写入，首次结果
+  仍可用原请求重放；
+- **失败不占用键**：版本不存在、求值失败（如 422 `NOT_CONVERGED`）等
+  请求级错误会回滚整个事务，不留幂等记录，可用同一键修正后重试；
+- **未携带键的调用保持现有行为**：持久化调用每次求值都产生一条新记录；
+- **非持久化调用携带键将被明确拒绝**：`persist=false` 与
+  `Idempotency-Key` 同时出现返回 **HTTP 400**
+  `IDEMPOTENCY_KEY_REQUIRES_PERSIST`；空白键返回 400
+  `INVALID_IDEMPOTENCY_KEY`（键长度上限 200，超长由请求校验返回 422）。
+
+成功响应结构与不带键时完全一致（见 [三分钟试用](#三分钟试用)），客户端
+可直接按 `id` 去重；规则集不存在仍返回 404 `NOT_FOUND`，指定版本不存在
+仍返回 404 `VERSION_NOT_FOUND`。
+
+调用示例：
+
+```bash
+# 首次受理：固定当时最新版（v1）并落库，关联幂等键 order-1001
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1001' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}, "region": "north"}}'
+
+# 同键重试（即使对象键顺序不同、期间已发布 v2）：返回首次结果与同一 id
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1001' \
+  -d '{"document": {"region": "north", "customer": {"vip": true}, "amount": 1500}}'
+
+# 同键换了文档 → 409 IDEMPOTENCY_KEY_CONFLICT（details.document=document_mismatch）
+curl -i -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1001' \
+  -d '{"document": {"amount": 1}}'
+
+# 同键改版本选择方式（首次未指定版本，重试显式 ?version=1）→ 409
+curl -i -X POST 'localhost:8000/api/rulesets/demo-promotions/evaluate?version=1' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1001' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}, "region": "north"}}'
+
+# persist=false 携带键 → 400 IDEMPOTENCY_KEY_REQUIRES_PERSIST
+curl -i -X POST 'localhost:8000/api/rulesets/demo-promotions/evaluate?persist=false' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1001' \
+  -d '{"document": {"amount": 1500}}'
+```
+
+> 说明：幂等键仅在**单文档** `evaluate` 接口生效；`evaluate-batch` 等
+> 其他接口不识别该请求头。并发重试通过 SQLite 立即写事务
+> （`BEGIN IMMEDIATE`）串行化“查重—求值—落库”，保证同键并发时只有一个
+> 请求实际求值并落库。
 
 ### 多文档覆盖分析
 
@@ -923,5 +996,8 @@ pytest -q
 多文档覆盖分析（rule/group/field 覆盖单元/命中与未命中统计/冲突场景去重与观察下标/
 确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422）、
 规则集快照迁移（导出包结构/规范化摘要/导入 created·matched·appended 幂等分支/
-版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404），
+版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404）、
+单文档决策客户端幂等（同键重试返回首次结果与原记录 ID/对象键序重排视为相同/
+重试跨新版本固定首次版本/同键文档或版本选择方式冲突 409/失败不占用键/
+非持久化携带键 400/无键行为不变/规则集与版本 404 语义/多连接并发只求值落库一次），
 以及完整 HTTP 接口。

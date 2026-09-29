@@ -63,6 +63,23 @@ CREATE INDEX IF NOT EXISTS idx_evaluations_ruleset
 CREATE INDEX IF NOT EXISTS idx_evaluations_ruleset_version
     ON evaluations(ruleset_id, version);
 
+-- 单文档决策的客户端幂等记录：键作用域为规则集。
+-- version_mode/explicit_version 固定首次受理时的版本选择方式，
+-- document_canonical 为按对象键排序规范化后的文档，
+-- evaluation_id 关联 evaluations 中保存的完整决策结果。
+CREATE TABLE IF NOT EXISTS idempotent_decisions (
+    id                 TEXT PRIMARY KEY,
+    ruleset_id         TEXT NOT NULL REFERENCES rulesets(id),
+    idempotency_key    TEXT NOT NULL,
+    version_mode       TEXT NOT NULL,         -- latest=使用受理时最新版；explicit=指定版本
+    explicit_version   INTEGER,               -- version_mode=explicit 时的请求版本号
+    actual_version     INTEGER NOT NULL,      -- 首次受理实际固定求值的版本
+    document_canonical TEXT NOT NULL,         -- 规范化（sort_keys）后的文档 JSON
+    evaluation_id      TEXT NOT NULL REFERENCES evaluations(id),
+    created_at         TEXT NOT NULL,
+    UNIQUE(ruleset_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

@@ -616,3 +616,114 @@ def _row_to_evaluation(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         **result,
     }
+
+
+# ---------- 单文档决策的客户端幂等 ----------
+
+
+VERSION_MODE_LATEST = "latest"
+VERSION_MODE_EXPLICIT = "explicit"
+
+IDEMPOTENCY_KEY_MAX_LENGTH = 200
+
+
+class IdempotencyConflict(ValueError):
+    """同一规则集下幂等键重复，但文档或版本选择方式与首次受理不一致。"""
+
+    def __init__(self, details: dict[str, Any]):
+        super().__init__("幂等键冲突")
+        self.details = details
+
+
+def canonical_document(document: Any) -> str:
+    """把文档序列化为按对象键排序的规范 JSON（冲突比较的稳定身份）。
+
+    sort_keys 递归排序对象键；列表保序（数组顺序是文档语义的一部分）；
+    ensure_ascii=False、紧凑分隔，保证同一 JSON 文档无论键序如何，
+    规范化结果一致。
+    """
+    return json.dumps(
+        document, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def idempotent_evaluate(
+    conn: sqlite3.Connection,
+    ruleset_id: str,
+    idempotency_key: str,
+    document: Any,
+    version_mode: str,
+    explicit_version: int | None,
+    prepare_and_evaluate,
+) -> tuple[dict[str, Any], bool]:
+    """带客户端幂等键的持久化单文档决策。
+
+    调用方须先完成规则集存在性校验（保持原 404 语义），并通过
+    ``prepare_and_evaluate()`` 回调提供“在写锁内解析版本 → 编译 → 求值”
+    的实际逻辑，回调返回 ``(result, actual_version)``；指定版本不存在时
+    回调应抛 :class:`LookupError`（由上层映射为 404，事务回滚、不占用键）。
+
+    整个“查重—求值—落库”在 **BEGIN IMMEDIATE 写事务**内完成：
+
+    - 键命中且文档、版本选择方式一致：直接回读首次结果与原记录 ID，
+      **不解析版本、不重复求值、不重复落库**（即使期间已发布新版本，
+      latest 模式也固定返回首次受理时的版本结果）；
+    - 键命中但文档或版本选择方式不同：抛 :class:`IdempotencyConflict`，
+      事务回滚，不产生任何写入；
+    - 键未命中：在锁内解析并固定实际版本、执行一次回调求值，与
+      evaluations 记录、规则集、键、版本选择方式、规范化文档原子关联
+      保存。回调或求值抛出的任何异常都会回滚事务，**失败不占用键**。
+
+    返回 (决策记录, created)：created=True 表示首次受理新落库，
+    False 表示返回首次结果。
+    """
+    document_text = canonical_document(document)
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        """SELECT id, explicit_version, version_mode, document_canonical,
+                  evaluation_id
+           FROM idempotent_decisions
+           WHERE ruleset_id = ? AND idempotency_key = ?""",
+        (ruleset_id, idempotency_key),
+    ).fetchone()
+    if row is not None:
+        mismatch: dict[str, Any] = {}
+        stored_mode = row["version_mode"]
+        if stored_mode != version_mode or row["explicit_version"] != explicit_version:
+            mismatch["version_selection"] = {
+                "stored": {
+                    "mode": stored_mode,
+                    "version": row["explicit_version"],
+                },
+                "current": {"mode": version_mode, "version": explicit_version},
+            }
+        if row["document_canonical"] != document_text:
+            mismatch["document"] = "document_mismatch"
+        if mismatch:
+            mismatch["idempotency_key"] = idempotency_key
+            raise IdempotencyConflict(mismatch)
+        record = get_evaluation(conn, row["evaluation_id"])
+        return record, False
+
+    # 未命中：在写锁内解析并固定实际版本后求值（回调内完成版本解析）
+    result, actual_version = prepare_and_evaluate()
+    record = save_evaluation(conn, ruleset_id, actual_version, document, result)
+    ts = now()
+    conn.execute(
+        """INSERT INTO idempotent_decisions
+           (id, ruleset_id, idempotency_key, version_mode, explicit_version,
+            actual_version, document_canonical, evaluation_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            new_id(),
+            ruleset_id,
+            idempotency_key,
+            version_mode,
+            explicit_version,
+            actual_version,
+            document_text,
+            record["id"],
+            ts,
+        ),
+    )
+    return record, True

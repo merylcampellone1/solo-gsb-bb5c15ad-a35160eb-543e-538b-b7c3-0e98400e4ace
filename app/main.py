@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import crud
@@ -481,31 +481,113 @@ def _persist_evaluation(
     "/api/rulesets/{ruleset_id}/evaluate",
     response_model=EvaluationOut,
     tags=["evaluation"],
-    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
 )
 def evaluate_document(
     ruleset_id: str,
     req: EvaluateRequest,
     version: int | None = Query(None, ge=1, description="指定版本；默认最新版"),
     persist: bool = Query(True, description="是否持久化本次结果"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=crud.IDEMPOTENCY_KEY_MAX_LENGTH,
+        description=(
+            "客户端幂等键：仅持久化调用允许携带。同一规则集内，键相同且"
+            "文档与版本选择方式一致的重试返回首次结果与原记录 ID；"
+            "文档或版本选择方式不同返回 409。"
+        ),
+    ),
     conn: sqlite3.Connection = Depends(get_db),
 ) -> Any:
+    """单文档决策。
+
+    默认持久化（``persist=true``）：
+
+    - 携带 ``Idempotency-Key`` 请求头时启用客户端幂等：首次受理固定实际
+      规则版本，关联保存规则集、键、版本选择方式（最新版/指定版本号）、
+      按对象键排序规范化的文档与完整决策结果；之后同一规则集同一键的
+      相同请求（含并发重试、期间已发布新版本）直接返回首次结果及原记录
+      ID，不重复求值或落库；
+    - 同键但文档或版本选择方式不同返回 409 ``IDEMPOTENCY_KEY_CONFLICT``；
+    - 求值失败不占用键（事务回滚，可用同键重试）。
+
+    不携带键的持久化调用保持原有“每次求值都新增记录”的行为；
+    非持久化调用（``persist=false``）携带键返回 400
+    ``IDEMPOTENCY_KEY_REQUIRES_PERSIST``。规则集不存在返回 404
+    ``NOT_FOUND``，指定版本不存在返回 404 ``VERSION_NOT_FOUND``。
+    """
     row = crud.get_ruleset(conn, ruleset_id)
     if row is None:
         return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
 
-    target_version = version or row["current_version"]
+    if idempotency_key is not None:
+        if not persist:
+            return _error(
+                "IDEMPOTENCY_KEY_REQUIRES_PERSIST",
+                "非持久化调用（persist=false）不允许携带 Idempotency-Key；"
+                "幂等键仅在结果持久化时可用",
+                400,
+            )
+        if not idempotency_key.strip():
+            return _error(
+                "INVALID_IDEMPOTENCY_KEY", "Idempotency-Key 不能为空白字符串", 400
+            )
+
+    explicit = version is not None
+
+    def _prepare_and_evaluate() -> tuple[dict[str, Any], int]:
+        # 写事务内解析并固定实际版本（latest 模式取当前最新版）后编译求值；
+        # 键命中重试时不会执行到这里，因此期间发布的新版本不会被解析。
+        target_version = version if explicit else row["current_version"]
+        _snapshot, loaded = _load_compiled(conn, ruleset_id, target_version)
+        return evaluate(loaded, req.document), target_version
+
+    if idempotency_key is None:
+        target_version = version if explicit else row["current_version"]
+        try:
+            _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
+        except LookupError:
+            return _error(
+                "VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404
+            )
+        result = evaluate(compiled, req.document)
+        return _persist_evaluation(
+            conn, ruleset_id, target_version, req.document, result, persist
+        )
+
     try:
-        _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
+        record, _created = crud.idempotent_evaluate(
+            conn,
+            ruleset_id,
+            idempotency_key,
+            req.document,
+            version_mode=(
+                crud.VERSION_MODE_EXPLICIT if explicit else crud.VERSION_MODE_LATEST
+            ),
+            explicit_version=version if explicit else None,
+            prepare_and_evaluate=_prepare_and_evaluate,
+        )
     except LookupError:
+        # 指定版本不存在（或受理时刻最新版本缺失）：保持原错误语义，
+        # 事务回滚、不占用键
+        target_version = version if explicit else row["current_version"]
         return _error(
             "VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404
         )
-
-    result = evaluate(compiled, req.document)
-    return _persist_evaluation(
-        conn, ruleset_id, target_version, req.document, result, persist
-    )
+    except crud.IdempotencyConflict as exc:
+        return _error(
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "该幂等键已用于不同的请求：文档或版本选择方式与首次受理不一致",
+            409,
+            details=exc.details,
+        )
+    return record
 
 
 @app.post(
