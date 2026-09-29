@@ -25,7 +25,8 @@ def client():
     conn = connect()
     init_db(conn)
     conn.executescript(
-        "DELETE FROM evaluations; DELETE FROM ruleset_versions; DELETE FROM rulesets;"
+        "DELETE FROM idempotency_keys; DELETE FROM evaluations; "
+        "DELETE FROM ruleset_versions; DELETE FROM rulesets;"
     )
     conn.commit()
     conn.close()

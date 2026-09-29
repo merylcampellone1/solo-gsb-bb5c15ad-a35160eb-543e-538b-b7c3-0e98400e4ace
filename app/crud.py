@@ -36,6 +36,176 @@ class InvalidCustomId(ValueError):
     """自定义规则集 id 非法。"""
 
 
+# ---------- 幂等键 ----------
+
+
+VERSION_MODE_LATEST = "latest"
+VERSION_MODE_PINNED = "pinned"
+
+
+class IdempotencyConflict(ValueError):
+    """同一 (规则集, 幂等键) 再次出现，但文档或版本选择方式与首次不一致。"""
+
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+def canonical_json(value: Any) -> str:
+    """递归按对象键排序的规范化 JSON（紧凑、UTF-8、不转义非 ASCII）。
+
+    与快照摘要一致：sort_keys 保证不同键序的等价文档得到相同串，
+    数组按下标保序（顺序即语义）。
+    """
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def document_fingerprint(document: Any) -> tuple[str, str]:
+    """返回 (规范化文档 JSON, 其 sha256)。"""
+    canonical = canonical_json(document)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return canonical, digest
+
+
+def request_fingerprint(
+    version_mode: str, pin: int | None, doc_hash: str
+) -> str:
+    """版本选择方式 + 指定版本（latest 为空）+ 文档哈希的复合指纹。
+
+    latest 模式不包含解析出的实际版本号——因此“首次用最新版、之后发布了
+    新版本再重试”仍与首次选择方式一致，应回放首次结果。
+    """
+    return f"{version_mode}:{pin if pin is not None else ''}:{doc_hash}"
+
+
+def get_idempotency(
+    conn: sqlite3.Connection, ruleset_id: str, key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM idempotency_keys WHERE ruleset_id = ? AND key = ?",
+        (ruleset_id, key),
+    ).fetchone()
+
+
+def evaluate_idempotent(
+    conn: sqlite3.Connection,
+    ruleset_id: str,
+    key: str,
+    version_mode: str,
+    pin: int | None,
+    resolve_version,
+    document: Any,
+    evaluator,
+):
+    """幂等求值：命中已存键直接返回首次记录；否则在写锁内求值并原子落库。
+
+    - ``pin``：pinned 模式时客户端指定的版本号；latest 模式为 ``None``；
+    - ``resolve_version(conn)``：在事务内解析实际版本（latest 取当前版本，
+      pinned 取指定版本），版本不存在抛 ``LookupError``；
+    - ``evaluator(conn, target_version)``：编译对应版本并对文档求值，
+      返回 result；求值失败允许抛出（此时不占键，事务整体回滚）。
+
+    并发安全：先做一次无锁快查命中；未命中则 ``BEGIN IMMEDIATE`` 取写锁后
+    复查，保证同键并发请求只有一个真正求值落库，其余复用首次结果。
+
+    返回 (record, replayed)：replayed=True 表示复用了首次结果。
+    同键但文档或版本选择方式（模式 / 指定版本）不同抛
+    :class:`IdempotencyConflict`。
+    """
+    canonical, doc_hash = document_fingerprint(document)
+
+    # 无锁快查：命中直接复用，避免重复求值
+    existing = get_idempotency(conn, ruleset_id, key)
+    if existing is not None:
+        return _replay_or_conflict(existing, version_mode, pin, doc_hash, conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 取写锁后复查：并发请求可能已在此期间完成首次受理
+        existing = get_idempotency(conn, ruleset_id, key)
+        if existing is not None:
+            record, _replayed = _replay_or_conflict(
+                existing, version_mode, pin, doc_hash, conn
+            )
+            return record, True
+
+        target_version = resolve_version(conn)
+        result = evaluator(conn, target_version)
+        record = save_evaluation(conn, ruleset_id, target_version, document, result)
+        fingerprint = request_fingerprint(version_mode, pin, doc_hash)
+        conn.execute(
+            """INSERT INTO idempotency_keys
+               (ruleset_id, key, version_mode, pinned_version,
+                document_hash, document_canonical, fingerprint,
+                evaluation_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ruleset_id,
+                key,
+                version_mode,
+                pin,
+                doc_hash,
+                canonical,
+                fingerprint,
+                record["id"],
+                record["created_at"],
+            ),
+        )
+        return record, False
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _replay_or_conflict(
+    existing: sqlite3.Row,
+    version_mode: str,
+    pin: int | None,
+    doc_hash: str,
+    conn: sqlite3.Connection,
+):
+    """已存键：版本选择方式（模式/指定版本）或文档不同 → 409；否则返回首次记录。"""
+    if (
+        existing["version_mode"] != version_mode
+        or existing["pinned_version"] != pin
+    ):
+        raise IdempotencyConflict(
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "幂等键已用于不同的版本选择方式",
+            {
+                "idempotency_key": existing["key"],
+                "field": "version_selection",
+                "original": {
+                    "mode": existing["version_mode"],
+                    "version": existing["pinned_version"],
+                },
+                "conflicting": {"mode": version_mode, "version": pin},
+            },
+        )
+    if existing["document_hash"] != doc_hash:
+        raise IdempotencyConflict(
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "幂等键已用于不同的请求文档",
+            {
+                "idempotency_key": existing["key"],
+                "field": "document",
+            },
+        )
+    record = get_evaluation(conn, existing["evaluation_id"])
+    if record is None:
+        # 理论上不会发生（外键约束 + 同事务落库）；防御性兜底
+        raise IdempotencyConflict(
+            "IDEMPOTENCY_RECORD_MISSING",
+            "幂等键关联的首次决策记录不存在",
+            {"idempotency_key": existing["key"]},
+        )
+    return record, True
+
+
 # ---------- 序列化 ----------
 
 

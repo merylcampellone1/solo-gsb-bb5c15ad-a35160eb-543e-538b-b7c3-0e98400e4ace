@@ -188,7 +188,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
 | `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
-| `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
+| `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果；可携带 `Idempotency-Key` 请求头做客户端幂等（见下） |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
 | `POST` | `/api/rulesets/{id}/coverage` | 多文档覆盖分析（1～100 份，不落库）：命中/未命中规则、已观察冲突场景与贪心代表输入 |
 | `POST` | `/api/rulesets/{id}/compare` | 发布前预演：同一文档按两个版本求值（不落库），返回两版决策与差异摘要 |
@@ -213,6 +213,105 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
 # 3) 查询历史结果
 curl -s localhost:8000/api/rulesets/demo-promotions/evaluations | python3 -m json.tool
 ```
+
+### 单文档决策的客户端幂等键
+
+对**单文档持久化决策** `POST /api/rulesets/{id}/evaluate`（`persist` 默认为
+true），可通过 HTTP 请求头 **`Idempotency-Key`** 传入客户端幂等键，保证
+“同一笔决策”因网络重试、客户端重发或并发提交时**只求值、只落库一次**。
+
+行为语义：
+
+- **首次受理**：固定本次实际使用的规则版本，将规则集、幂等键、请求的**版本
+  选择方式**、**按对象键排序规范化的文档**以及完整决策结果关联保存（键按
+  规则集隔离，不同规则集可复用同名键）；
+- **同键重试 / 并发重试**：同一规则集、同一键、相同请求（文档与版本选择方式
+  都一致）即使并发到达或期间规则集发布了新版本，也直接返回**首次结果与原记录
+  ID**，不重复求值、不重复落库；
+- **同键冲突**：键相同但**文档不同**，或**版本选择方式不同**（`?version=n`
+  指定版本 vs 缺省最新版；以及指定了不同的 `n`），返回 **HTTP 409**
+  `IDEMPOTENCY_KEY_CONFLICT`，`details.field` 区分 `document` /
+  `version_selection`，并在后者中回显首次与本次的选择方式；
+- **失败不占键**：求值失败（如 `NOT_CONVERGED`）返回 422 且**不写入幂等记录**，
+  同一键可被后续成功请求使用；
+- **未携带键**：保持原有行为——每次调用都重新求值并产生新记录；
+- **非持久化调用携带键**：`persist=false` 时携带 `Idempotency-Key` 被**明确
+  拒绝**（HTTP 400 `IDEMPOTENCY_KEY_REQUIRES_PERSIST`）；
+- 幂等键为最多 255 字符的非空字符串；纯空白头按未携带处理；
+- 成功响应结构与普通 `evaluate` **完全一致**（`EvaluationOut`），规则集或
+  指定版本不存在仍返回原有的 404 `NOT_FOUND` / `VERSION_NOT_FOUND`。
+
+> 文档规范化：对象按键递归排序（`{"b":2,"a":1}` 与 `{"a":1,"b":2}` 视为
+> 同一请求），数组按下标保序（顺序属于语义）。
+
+请求示例（携带幂等键）：
+
+```bash
+# 首次受理：固定版本（假设当前为 v1）并落库，返回记录 ID
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}}}'
+# -> {"id": "c699...", "version": 1, "decision": {...}, ...}
+
+# 重试 / 重发（即使键序写法不同，规范化后等价）
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"customer": {"vip": true}, "amount": 1500}}'
+# -> 200，返回同一 id、同一 version=1 与首次完整结果；不会产生第二条记录
+
+# 期间规则集发布了 v2：缺省“最新版”的重试仍返回首次固定的 v1 结果
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}}}'
+# -> 200，version 仍为首次的 1，id 不变
+```
+
+同键不同文档 → 409：
+
+```bash
+curl -i -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"amount": 80}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "IDEMPOTENCY_KEY_CONFLICT",
+#   "message": "幂等键已用于不同的请求文档",
+#   "details": {"idempotency_key": "order-20260929-0001", "field": "document"}}}
+```
+
+同键不同版本选择方式 → 409（首次缺省最新版，本次指定 `?version=2`）：
+
+```bash
+curl -i -X POST 'localhost:8000/api/rulesets/demo-promotions/evaluate?version=2' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"amount": 1500, "customer": {"vip": true}}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "IDEMPOTENCY_KEY_CONFLICT",
+#   "message": "幂等键已用于不同的版本选择方式",
+#   "details": {"idempotency_key": "order-20260929-0001",
+#     "field": "version_selection",
+#     "original": {"mode": "latest", "version": null},
+#     "conflicting": {"mode": "pinned", "version": 2}}}}
+```
+
+非持久化调用携带键 → 400：
+
+```bash
+curl -i -X POST 'localhost:8000/api/rulesets/demo-promotions/evaluate?persist=false' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-20260929-0001' \
+  -d '{"document": {"amount": 1500}}'
+# HTTP/1.1 400 Bad Request
+# {"error": {"code": "IDEMPOTENCY_KEY_REQUIRES_PERSIST",
+#   "message": "非持久化调用（persist=false）不支持幂等键", "details": {}}}
+```
+
+> 幂等能力仅用于**单文档** `evaluate`；批量（evaluate-batch）、覆盖
+> （coverage）、预演（compare）、重算（recompute）不接受幂等键。
 
 ### 批量评估
 
@@ -923,5 +1022,8 @@ pytest -q
 多文档覆盖分析（rule/group/field 覆盖单元/命中与未命中统计/冲突场景去重与观察下标/
 确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422）、
 规则集快照迁移（导出包结构/规范化摘要/导入 created·matched·appended 幂等分支/
-版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404），
+版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404）、
+单文档决策客户端幂等键（首次落库并固定版本/同键重放返回首次记录 ID/
+新版本发布仍固定首次版本/文档按对象键排序规范化/同键不同文档或版本选择方式 409/
+求值失败不占键/非持久化携带键 400/无键行为不变/键按规则集隔离/并发只落一条），
 以及完整 HTTP 接口。

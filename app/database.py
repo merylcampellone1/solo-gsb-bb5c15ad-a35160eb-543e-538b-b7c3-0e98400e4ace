@@ -63,6 +63,19 @@ CREATE INDEX IF NOT EXISTS idx_evaluations_ruleset
 CREATE INDEX IF NOT EXISTS idx_evaluations_ruleset_version
     ON evaluations(ruleset_id, version);
 
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    ruleset_id  TEXT NOT NULL REFERENCES rulesets(id),
+    key         TEXT NOT NULL,         -- 客户端幂等键（规则集内唯一）
+    version_mode TEXT NOT NULL,        -- 版本选择方式：latest / pinned
+    pinned_version INTEGER,            -- version_mode=pinned 时指定的版本
+    document_hash TEXT NOT NULL,       -- 规范化文档的 sha256
+    document_canonical TEXT NOT NULL,  -- 按对象键排序规范化后的文档 JSON
+    fingerprint TEXT NOT NULL,         -- 版本选择方式 + 版本 + 文档的复合指纹
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (ruleset_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -75,10 +88,13 @@ def connect(database: str | None = None) -> sqlite3.Connection:
     path = _sqlite_path(url)
     if path != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(
+        path, check_same_thread=False, timeout=10.0
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import crud
@@ -481,31 +481,109 @@ def _persist_evaluation(
     "/api/rulesets/{ruleset_id}/evaluate",
     response_model=EvaluationOut,
     tags=["evaluation"],
-    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
 )
 def evaluate_document(
     ruleset_id: str,
     req: EvaluateRequest,
     version: int | None = Query(None, ge=1, description="指定版本；默认最新版"),
     persist: bool = Query(True, description="是否持久化本次结果"),
+    idempotency_key: str | None = Header(
+        None,
+        alias="Idempotency-Key",
+        description=(
+            "客户端幂等键；仅持久化调用可用。同规则集同键的相同请求复用首次"
+            "结果与记录 ID（即使并发重试或期间发布新版本）；文档或版本选择"
+            "方式不同返回 409；求值失败不占用键"
+        ),
+    ),
     conn: sqlite3.Connection = Depends(get_db),
 ) -> Any:
+    """单文档决策。
+
+    携带 ``Idempotency-Key`` 时（仅持久化调用允许）：首次受理即固定实际
+    规则版本，将规则集、键、请求的版本选择方式、按对象键排序规范化的文档
+    及完整决策结果关联保存；之后同规则集同键的相同请求即使并发重试或期间
+    出现新版本，也返回首次结果及原记录 ID，不重复求值或落库。键相同但
+    文档或版本选择方式不同返回 409；求值失败（如 NOT_CONVERGED）不占用键。
+    未携带键的调用保持原有行为。
+    """
     row = crud.get_ruleset(conn, ruleset_id)
     if row is None:
         return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
 
-    target_version = version or row["current_version"]
-    try:
-        _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
-    except LookupError:
-        return _error(
-            "VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404
+    # 幂等键只对持久化调用有意义；非持久化试算携带键明确拒绝。
+    # 纯空白键经 HTTP 传输规范化后等同未携带，按无键处理。
+    key = idempotency_key.strip() if idempotency_key is not None else None
+    if not key:
+        key = None
+    if key is not None:
+        if not persist:
+            return _error(
+                "IDEMPOTENCY_KEY_REQUIRES_PERSIST",
+                "非持久化调用（persist=false）不支持幂等键",
+                400,
+            )
+        if len(key) > 255:
+            return _error(
+                "INVALID_IDEMPOTENCY_KEY",
+                "幂等键长度不能超过 255 个字符",
+                400,
+            )
+
+    version_mode = (
+        crud.VERSION_MODE_PINNED if version is not None else crud.VERSION_MODE_LATEST
+    )
+
+    def _resolve_version(db: sqlite3.Connection) -> int:
+        if version is not None:
+            return version
+        return crud.get_ruleset(db, ruleset_id)["current_version"]
+
+    def _evaluator(
+        db: sqlite3.Connection, target_version: int
+    ) -> dict[str, Any]:
+        _snapshot, compiled = _load_compiled(db, ruleset_id, target_version)
+        return evaluate(compiled, req.document)
+
+    if key is None:
+        target_version = version or row["current_version"]
+        try:
+            _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
+        except LookupError:
+            return _error(
+                "VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404
+            )
+        result = evaluate(compiled, req.document)
+        return _persist_evaluation(
+            conn, ruleset_id, target_version, req.document, result, persist
         )
 
-    result = evaluate(compiled, req.document)
-    return _persist_evaluation(
-        conn, ruleset_id, target_version, req.document, result, persist
-    )
+    try:
+        record, _replayed = crud.evaluate_idempotent(
+            conn,
+            ruleset_id,
+            key,
+            version_mode,
+            version,
+            _resolve_version,
+            req.document,
+            _evaluator,
+        )
+    except LookupError:
+        # 事务已在 crud 内回滚；latest 模式不会发生（当前版本必然存在），
+        # pinned 模式下保留原有 VERSION_NOT_FOUND 语义。
+        return _error(
+            "VERSION_NOT_FOUND", f"版本 {version} 不存在", 404
+        )
+    except crud.IdempotencyConflict as exc:
+        return _error(exc.code, exc.message, 409, details=exc.details)
+    return record
 
 
 @app.post(
